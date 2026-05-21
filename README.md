@@ -15,6 +15,10 @@ can:
 **Read-only by design.** The server never issues writes (POST/PUT/PATCH/DELETE)
 to any remote — no pushes, no uploads, no repo modifications.
 
+> **Project docs:** [`PLANNING.md`](PLANNING.md) tracks scope + roadmap;
+> [`HISTORY.md`](HISTORY.md) keeps the narrative log of decisions and
+> pending items.
+
 ---
 
 ## Requirements
