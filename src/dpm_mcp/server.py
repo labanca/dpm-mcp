@@ -23,6 +23,14 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from . import __version__
+from .catalog import (
+    CatalogEntry,
+    CatalogSummary,
+    DEFAULT_TTL,
+    filter_entries,
+    get_default_cache,
+    summarize,
+)
 from .datapackage import (
     DatapackageError,
     download_datapackage as _download_datapackage,
@@ -57,6 +65,25 @@ mcp = FastMCP(
 
 def _default_output_dir() -> str:
     return os.getenv("DPM_MCP_OUTPUT_DIR", "datapackages")
+
+
+def _default_catalog_sources() -> list[str]:
+    raw = os.getenv("DPM_MCP_CATALOG_SOURCES", "").strip()
+    if not raw:
+        return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _resolve_catalog_sources(sources: list[str] | None) -> list[str]:
+    if sources:
+        return sources
+    configured = _default_catalog_sources()
+    if not configured:
+        raise RuntimeError(
+            "No catalog sources configured. Either pass 'sources' to this tool, or set "
+            "DPM_MCP_CATALOG_SOURCES (e.g. 'org:splor-mg,user:someone')."
+        )
+    return configured
 
 
 @mcp.tool()
@@ -306,13 +333,143 @@ async def install_from_toml(
     return result
 
 
+@mcp.tool()
+async def search_datapackages(
+    query: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Free-text search. Matches against package name/title/description and every "
+                "resource's name/title/description/schema-field name+description. Multiple words "
+                "are AND-combined."
+            )
+        ),
+    ] = None,
+    org: Annotated[
+        str | None,
+        Field(description="Restrict to a specific GitHub org (case-insensitive)."),
+    ] = None,
+    user: Annotated[
+        str | None,
+        Field(description="Restrict to a specific GitHub user (case-insensitive)."),
+    ] = None,
+    has_resource: Annotated[
+        str | None,
+        Field(description="Only return packages with at least one resource whose name contains this substring."),
+    ] = None,
+    field_name: Annotated[
+        str | None,
+        Field(description="Only return packages with at least one schema field whose name contains this substring."),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(description="Max entries returned. Set to 0 for unlimited.", ge=0),
+    ] = 20,
+    sources: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Override catalog sources for this call. Each entry: 'org:NAME' or 'user:NAME'. "
+                "Defaults to DPM_MCP_CATALOG_SOURCES."
+            )
+        ),
+    ] = None,
+    force_refresh: Annotated[
+        bool,
+        Field(description="Force a catalog rebuild even if the cached copy is still fresh."),
+    ] = False,
+    token: Annotated[
+        str | None,
+        Field(description="PAT (literal or env var name) for private repo discovery."),
+    ] = None,
+) -> list[CatalogEntry]:
+    """Search the catalog of datapackages discoverable through configured sources.
+
+    The catalog is built lazily on first call and cached in-memory for
+    DPM_MCP_CATALOG_TTL_SECONDS (default 1h). Building scans each configured
+    org/user for repos containing a datapackage descriptor, then downloads and
+    parses each descriptor in parallel.
+
+    Typical agent flow:
+        1. `get_catalog_summary()` once to see what's available at a high level.
+        2. `search_datapackages(query="execucao orcamentaria")` to narrow.
+        3. `inspect_datapackage(source=...)` for the most promising candidate.
+        4. `download_datapackage(source=..., resources=[...])` to fetch data.
+    """
+    resolved_sources = _resolve_catalog_sources(sources)
+    try:
+        entries = await get_default_cache().get(
+            resolved_sources, token=token, force_refresh=force_refresh
+        )
+    except GitHubError as e:
+        raise RuntimeError(str(e)) from e
+    return filter_entries(
+        entries,
+        query=query,
+        org=org,
+        user=user,
+        has_resource=has_resource,
+        field_name=field_name,
+        limit=limit,
+    )
+
+
+@mcp.tool()
+async def get_catalog_summary(
+    sources: Annotated[
+        list[str] | None,
+        Field(description="Override catalog sources for this call."),
+    ] = None,
+    force_refresh: Annotated[
+        bool,
+        Field(description="Force a catalog rebuild."),
+    ] = False,
+    token: Annotated[
+        str | None,
+        Field(description="PAT (literal or env var name)."),
+    ] = None,
+) -> CatalogSummary:
+    """Return aggregate stats over the catalog: total packages, owners, common resource names.
+
+    Cheap call meant for the agent's first interaction — get a feel for what's available
+    before drilling down with `search_datapackages`.
+    """
+    resolved_sources = _resolve_catalog_sources(sources)
+    cache = get_default_cache()
+    try:
+        entries = await cache.get(resolved_sources, token=token, force_refresh=force_refresh)
+    except GitHubError as e:
+        raise RuntimeError(str(e)) from e
+    return summarize(
+        entries,
+        sources=resolved_sources,
+        age_seconds=cache.age_seconds,
+        refreshed_at=cache.refreshed_at,
+        ttl_seconds=cache.ttl,
+    )
+
+
 @mcp.resource("dpm-mcp://about")
 def about() -> str:
     """About this MCP server."""
+    sources = _default_catalog_sources()
+    src_line = (
+        f"Catalog sources: {', '.join(sources)}"
+        if sources
+        else "Catalog sources: (none configured — set DPM_MCP_CATALOG_SOURCES)"
+    )
     return (
         f"dpm-mcp {__version__}\n"
         f"Read-only MCP server for the SPLOR-MG Data Package Manager.\n"
         f"Downloads frictionless datapackages from git repositories.\n"
+        f"\n"
+        f"Typical discovery flow:\n"
+        f"  1. get_catalog_summary() — high-level overview\n"
+        f"  2. search_datapackages(query=...) — narrow to relevant packages\n"
+        f"  3. inspect_datapackage(source=...) — preview metadata\n"
+        f"  4. download_datapackage(source=..., resources=[...]) — fetch data\n"
+        f"\n"
+        f"{src_line}\n"
         f"\n"
         f"Auth: provide GITHUB_TOKEN in env (or pass 'token' per-call) to access "
         f"private repos and raise the API rate limit from 60 to 5000 req/hour.\n"

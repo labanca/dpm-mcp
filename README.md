@@ -53,6 +53,8 @@ Environment variables read at startup:
 | `DPM_MCP_OUTPUT_DIR` | `./datapackages` | Default download directory. |
 | `DPM_MCP_TRANSPORT` | `stdio` | One of `stdio`, `sse`, `streamable-http`. |
 | `DPM_MCP_LOG_LEVEL` | `INFO` | Standard Python logging level. |
+| `DPM_MCP_CATALOG_SOURCES` | `org:splor-mg` | Comma-separated default sources for `search_datapackages` / `get_catalog_summary`. Items can be `org:NAME`, `user:NAME`, or a bare name (treated as org). |
+| `DPM_MCP_CATALOG_TTL_SECONDS` | `3600` | How long the in-memory catalog is cached before refreshing on the next call. |
 
 PAT scopes:
 - Classic token: `repo` (private) or `public_repo` (public only).
@@ -124,6 +126,41 @@ Any client that supports stdio MCP servers can use the same command:
 ---
 
 ## Tools
+
+### `get_catalog_summary(sources?, token?, force_refresh?)`
+
+Returns an at-a-glance summary of the catalog (totals, packages per owner, most
+common resource names, cache age). Use this as the **first** call when an agent
+is orienting itself against a large catalog — it's small, cached, and tells you
+what to drill into next.
+
+```text
+> what's in the splor-mg catalog?
+```
+
+If `sources` is omitted, the server falls back to `DPM_MCP_CATALOG_SOURCES`.
+
+### `search_datapackages(query?, org?, user?, has_resource?, field_name?, ...)`
+
+Filters the cached catalog without downloading any data. All filters are AND-ed:
+
+- `query`: free-text — every word must appear (case-insensitive) somewhere in
+  the package name, title, description, or any resource name / field name.
+- `has_resource`: only packages exposing a resource by this name (case-insensitive
+  substring match).
+- `field_name`: only packages whose any resource schema has a field with this name.
+- `org` / `user`: restrict to a specific owner. By default uses the catalog
+  sources (see `DPM_MCP_CATALOG_SOURCES`).
+- `include_private`, `include_archived`, `include_errors`, `limit`.
+
+```text
+> find datapackages in splor-mg related to "sisor"
+> which packages expose a resource called "uo"?
+```
+
+Together with `inspect_datapackage` and `download_datapackage` this is the
+recommended discovery flow when you have **dozens or hundreds** of datapackages
+and don't want to bloat the agent context.
 
 ### `list_org_datapackages(org, token?, include_archived?, include_forks?)`
 
@@ -287,6 +324,40 @@ Restart Claude Code and check with `claude mcp list`. Any MCP-capable agent
   `raw.githubusercontent.com`. It is never echoed in tool responses.
 - Keep TLS enabled in front of the container — the bearer token authenticates
   every call, so an interceptor with the token has full server access.
+
+---
+
+## Skills (Claude clients)
+
+For Claude Code / Claude Desktop / Claude.ai users, this repo ships a set of
+**skill skeletons** under [`skills/`](skills/). They encode workflow knowledge
+that the MCP tools alone can't carry — naming conventions, how to combine
+multiple datapackages, multi-year analysis patterns, SISOR/SIGPLAN domain hints.
+
+Skills are **lazy-loaded by the agent** (Claude reads the `description`
+frontmatter and pulls the full body only when relevant), so they don't bloat
+your context window even as the catalog grows.
+
+To install:
+
+```powershell
+# Windows — user-level (all sessions)
+Copy-Item .\skills\*.md "$env:USERPROFILE\.claude\skills\" -Force
+```
+
+```bash
+# macOS / Linux — user-level
+cp skills/*.md ~/.claude/skills/
+```
+
+Project-level installation (`.claude/skills/` inside a given repo) is also
+supported. See [`skills/README.md`](skills/README.md) for details — most files
+contain TODO blocks where you should add team-specific conventions before
+trusting the agent with them.
+
+> **Non-Claude MCP clients** (Cursor, custom agents) don't load `.md` skills.
+> If you need equivalent guidance there, port the contents of `skills/*.md`
+> into your project system prompt or expose them as MCP prompts.
 
 ---
 
